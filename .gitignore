@@ -1,0 +1,29 @@
+# mac
+.DS_Store
+
+# node (just in case)
+node_modules/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# virtual envs
+.venv/
+venv/
+
+# editor
+.vscode/
+
+# secrets
+.env
+serviceAccount*.json
+*.pem
+*.key
+.secrets/
+**/.secrets/
+
+reports/
+
+data/

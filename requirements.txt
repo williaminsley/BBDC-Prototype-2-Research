@@ -1,0 +1,12 @@
+cryptography<45
+numpy<2
+pandas>=2.1,<2.3
+matplotlib
+pyarrow
+google-cloud-storage
+google-cloud-firestore
+nbconvert
+jupyter
+scikit-learn
+torch==2.2.2
+fastparquet
