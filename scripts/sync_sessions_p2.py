@@ -60,7 +60,9 @@ def check_credentials():
 
 
 def sync_via_firestore_manifest():
-    """Primary path: Firestore sessions_p2 collection as manifest, Storage for the blob."""
+    """
+    Primary path: Firestore sessions_p2 collection as manifest, Storage for the blob.
+    """
     fs_client = firestore.Client()
     storage_client = storage.Client()
     bucket = storage_client.bucket(BUCKET_NAME)
