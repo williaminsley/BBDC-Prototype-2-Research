@@ -27,3 +27,5 @@ serviceAccount*.json
 reports/
 
 data/
+
+plots/
