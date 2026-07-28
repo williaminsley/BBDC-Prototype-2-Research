@@ -32,16 +32,31 @@
 #
 set -euo pipefail
 
-# Resolve to the repo root (this script's own directory) so the run does not
-# depend on the caller's cwd. This matters: sync_sessions_p2.py resolves paths
-# from __file__, but the other three default to cwd-relative "data/...".
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve to the repo root so the run does not depend on the caller's cwd. This
+# matters: sync_sessions_p2.py resolves paths from __file__, but the other three
+# default to cwd-relative "data/...".
+#
+# The repo root is located by looking for the pipeline scripts themselves, so
+# this file works whether it sits at the repo root or inside scripts/.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SENTINEL="scripts/sync_sessions_p2.py"
+
+if [[ -f "${SCRIPT_DIR}/${SENTINEL}" ]]; then
+    REPO_ROOT="$SCRIPT_DIR"                          # this file is at the repo root
+elif [[ -f "${SCRIPT_DIR}/../${SENTINEL}" ]]; then
+    REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"      # this file is inside scripts/
+else
+    echo "ERROR: could not locate the repo root from ${SCRIPT_DIR}." >&2
+    echo "       Expected to find ${SENTINEL} there or one level up." >&2
+    echo "       Place run_pipeline.sh at the repo root or in scripts/." >&2
+    exit 2
+fi
 cd "$REPO_ROOT"
 
 PYTHON="${PYTHON:-python3}"
 SCRIPTS_DIR="scripts"
 REPORTS_DIR="reports"
-LOGS_DIR="logs"
+LOGS_DIR="reports/logs"
 VALIDATION_REPORT="${REPORTS_DIR}/session_export_validation_p2.json"
 
 ALL_STAGES=(sync validate raw windows)
