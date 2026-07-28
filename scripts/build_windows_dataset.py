@@ -111,6 +111,14 @@ SESSION_LEVEL_COLS = [
     "sessionId", "participantId", "sessionIndex", "identitySource", "schemaVersion",
     "appVersion", "deviceFamily", "devicePlatform", "deviceModel", "consentVersion",
     "completedNormally", "usableForSignalExtraction",
+    # Context questionnaire (build_raw_dataset.py SESSION_LEVEL_FIELDS). Listed
+    # explicitly here too: this list is a filter, not "everything from raw" — a
+    # column absent from it is silently dropped before reaching windows.csv, even
+    # if build_raw_dataset.py already extracted it. Sessions predating the
+    # questionnaire simply carry null in these, same as any other missing column.
+    "ctxFatigue", "ctxFocusLevel", "ctxTimeOfDay", "ctxInputDevice", "ctxMovement",
+    "ctxEnvironmentNoise", "ctxPrivacy", "ctxAlcohol", "ctxCaffeine", "ctxPosture",
+    "ctxHandUse",
 ]
 
 GESTURE_KIND_FIELDS = {
@@ -572,7 +580,7 @@ def scroll_features(win_events: pd.DataFrame) -> dict:
 
 def motion_features(win_events: pd.DataFrame, window_start: float, window_end: float) -> dict:
     motion = win_events[win_events["kind"] == "devicemotion"].sort_values("tRelMs")
-    out = {"motion_n_events": int(len(motion)), "motion_coverage_frac": coverage_pct(motion["tRelMs"], window_start, window_end)}
+    out = {"motion_n_events": int(len(motion)), "motion_coverage_pct": coverage_pct(motion["tRelMs"], window_start, window_end)}
 
     zero_centered_axes = {"payload_ax", "payload_ay", "payload_az", "payload_rotAlpha", "payload_rotBeta", "payload_rotGamma"}
     axes = ["payload_ax", "payload_ay", "payload_az", "payload_agx", "payload_agy", "payload_agz",
@@ -622,7 +630,7 @@ def motion_features(win_events: pd.DataFrame, window_start: float, window_end: f
 
 def orientation_features(win_events: pd.DataFrame, window_start: float, window_end: float) -> dict:
     orient = win_events[win_events["kind"] == "deviceorientation"].sort_values("tRelMs")
-    out = {"orientation_n_events": int(len(orient)), "orientation_coverage_frac": coverage_pct(orient["tRelMs"], window_start, window_end)}
+    out = {"orientation_n_events": int(len(orient)), "orientation_coverage_pct": coverage_pct(orient["tRelMs"], window_start, window_end)}
 
     for axis in ["payload_beta", "payload_gamma"]:
         if axis in orient.columns:
@@ -714,8 +722,8 @@ def build_session_windows(session_df: pd.DataFrame, window_ms: int, step_ms: int
         row["hasTouch"] = row["touch_n_touchstart"] > 0 or row["touch_n_touchmove"] > 0
         row["hasPointer"] = row["pointer_n_pointerdown"] > 0 or row["pointer_n_pointermove"] > 0
         row["hasScroll"] = row["scroll_n_events"] > 0
-        row["hasMotion"] = row["motion_coverage_frac"] > 0
-        row["hasOrientation"] = row["orientation_coverage_frac"] > 0
+        row["hasMotion"] = row["motion_coverage_pct"] > 0
+        row["hasOrientation"] = row["orientation_coverage_pct"] > 0
         row["hasGesture"] = any(row.get(f"{GESTURE_PREFIX[k]}_n_events", 0) > 0 for k in GESTURE_KIND_FIELDS)
 
         rows.append(row)

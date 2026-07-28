@@ -50,6 +50,30 @@ COMMON_EVENT_FIELDS = [
     "screenId", "componentId", "activeArea", "instructionArea",
 ]
 
+def _ctx_int(session: dict, key: str) -> Optional[int]:
+    """fatigue and focusLevel come off HTML range sliders, so session.context holds
+    them as string digits (e.g. "3"). Cast to int here rather than downstream, so
+    every consumer of the raw dataset gets a numeric column instead of an object
+    column of numeral strings that happens to sort correctly by luck."""
+    raw = (session.get("context") or {}).get(key)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# The context questionnaire (app.js renderContext / collectContextAnswers) writes
+# every answer into session.context under these exact keys. Segment-chip and
+# select fields are slugify()'d strings (e.g. "morning", "one_handed_right");
+# fatigue and focusLevel are range-slider values and need int casting (see
+# _ctx_int above) rather than being left as numeral strings.
+CONTEXT_STRING_FIELDS = [
+    "timeOfDay", "inputDevice", "movement", "environmentNoise",
+    "privacy", "alcohol", "caffeine", "posture", "handUse",
+]
+
 SESSION_LEVEL_FIELDS = {
     "sessionId": lambda s: s.get("sessionId"),
     "participantId": lambda s: s.get("participantId"),
@@ -64,6 +88,11 @@ SESSION_LEVEL_FIELDS = {
     "completedNormally": lambda s: s.get("completedNormally"),
     "usableForSignalExtraction": lambda s: (s.get("qualitySummary") or {}).get("usableForSignalExtraction"),
     "sessionDurationMs": lambda s: s.get("sessionDurationMs"),
+    # --- context questionnaire (previously collected by the app but not extracted here) ---
+    "ctxFatigue": lambda s: _ctx_int(s, "fatigue"),
+    "ctxFocusLevel": lambda s: _ctx_int(s, "focusLevel"),
+    **{f"ctx{key[0].upper()}{key[1:]}": (lambda s, key=key: (s.get("context") or {}).get(key))
+       for key in CONTEXT_STRING_FIELDS},
 }
 
 
