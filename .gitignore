@@ -31,3 +31,5 @@ data/
 plots/
 
 logs/
+
+notebooks/nb_outputs/
