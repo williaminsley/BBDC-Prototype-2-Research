@@ -71,6 +71,11 @@ from metadata import (
     compute_modality_affordance,
     stamp_task_context,
 )
+from primitives.typing_features import aggregate_typing_features
+from primitives.tap import aggregate_tap_features
+from primitives.gesture import aggregate_gesture_features, build_classified_interactions
+from primitives.coupling import aggregate_coupling_features
+from primitives.motion import aggregate_motion_features
 
 # --- window parameters -- see module docstring for rationale ---
 WINDOW_LENGTH_S = 15.0
@@ -287,17 +292,27 @@ def check_afforded_observed_consistency(windows: pd.DataFrame) -> None:
 
 def build_skeleton(raw_df: pd.DataFrame,
                     window_length_s: float = WINDOW_LENGTH_S,
-                    stride_s: float = WINDOW_STRIDE_S) -> pd.DataFrame:
+                    stride_s: float = WINDOW_STRIDE_S,
+                    return_corrected: bool = False):
     """
     Runs the full skeleton pass: correction pass -> window grid -> task
     context + afforded flags -> observed flags -> consistency check.
     Returns one row per window with NO behavioural feature columns yet.
+
+    If return_corrected=True, also returns the corrected raw event stream
+    (apply_corrections() output) as a second value -- needed by
+    build_full_dataset() below, which passes the CORRECTED stream (not the
+    raw one) to every feature-family aggregator so downstream families can
+    eventually be updated to consume payload_alpha_sin/cos,
+    payload_beta_residual, etc. NOTE (2026-08): as of this writing, none of
+    the five feature-family modules actually read those corrected columns
+    yet -- they all still compute from raw payload_alpha/beta/gamma
+    directly. Passing the corrected stream through is necessary groundwork
+    but not sufficient; each family needs a deliberate decision about
+    which of its features should switch to the corrected columns and
+    which shouldn't (see build_full_dataset()'s docstring for specifics).
     """
-    corrected = apply_corrections(raw_df)  # not yet consumed by the skeleton
-                                            # itself, but run here so the
-                                            # corrected stream exists ready
-                                            # for feature families to use
-                                            # once they're layered in
+    corrected = apply_corrections(raw_df)
     timeline = build_task_timeline(raw_df)
     affordance = compute_modality_affordance(raw_df, timeline)
 
@@ -306,6 +321,61 @@ def build_skeleton(raw_df: pd.DataFrame,
     windows = attach_observed_flags(windows, raw_df)
     windows = attach_straddle_flags(windows, timeline, affordance)
     check_afforded_observed_consistency(windows)
+
+    if return_corrected:
+        return windows, corrected
+    return windows
+
+
+def build_full_dataset(raw_df: pd.DataFrame,
+                        window_length_s: float = WINDOW_LENGTH_S,
+                        stride_s: float = WINDOW_STRIDE_S) -> pd.DataFrame:
+    """
+    The actual pipeline entry point: skeleton + all five feature families,
+    assembled into one windows table. This is what run_pipeline.sh's
+    build_windows_dataset.py step should call and save.
+
+    CORRECTED-STREAM USAGE (2026-08, open decision, not yet resolved):
+    build_skeleton() returns the corrected event stream (payload_alpha_sin/
+    cos, payload_beta_residual/baseline, orient_baseline_coverage_frac)
+    alongside the windows grid, but every feature-family aggregator below
+    is still called with the RAW stream, matching what each family's
+    self-check has been validated against so far. Switching any family to
+    consume the corrected stream instead is a deliberate per-family
+    decision, not a blanket switch -- for instance:
+      - motion.py's cross-axis correlation is explicitly diff-based and
+        wrap-insensitive by construction (see its orientation_series()
+        docstring), so it likely does NOT need the corrected columns.
+      - typing.py/tap.py/gesture.py/coupling.py don't touch alpha/beta/
+        gamma at all except coupling.py's orientation-coupling functions,
+        which use their OWN short local baseline (a different question
+        from corrections.py's 30s causal baseline -- see coupling.py's
+        docstring) and so also likely don't need corrections.py's output.
+    So there may be no live gap in practice -- but this hasn't been
+    checked family-by-family, and the corrected stream is threaded through
+    here so that check can happen without re-plumbing later.
+    """
+    windows, corrected = build_skeleton(raw_df, window_length_s, stride_s, return_corrected=True)
+
+    print("\n[assembly] typing features...")
+    windows = aggregate_typing_features(windows, raw_df)
+
+    print("[assembly] tap features...")
+    windows = aggregate_tap_features(windows, raw_df)
+
+    print("[assembly] gesture features...")
+    windows = aggregate_gesture_features(windows, raw_df)
+    interactions = build_classified_interactions(raw_df)
+
+    print("[assembly] coupling features...")
+    windows = aggregate_coupling_features(windows, raw_df, interactions)
+
+    print("[assembly] motion features...")
+    windows = aggregate_motion_features(windows, raw_df)
+
+    n_feature_cols = len(windows.columns) - 22  # 22 = skeleton/metadata column count
+    print(f"\n[assembly] done: {len(windows):,} windows x {len(windows.columns):,} columns "
+          f"({n_feature_cols:,} behavioural feature columns)")
 
     return windows
 
@@ -323,33 +393,42 @@ if __name__ == "__main__":
         print("No raw_events.parquet found -- skipping.")
         sys.exit(0)
 
-    raw = pd.read_parquet(raw_path)
+    # Column-selective load -- the full 181-column export costs ~1.7GB in
+    # pandas at this session count (documented project finding), and the
+    # assembly step below builds several intermediate per-event tables on
+    # top of that, which pushed a full-column load over this sandbox's
+    # memory ceiling. Only the columns actually referenced anywhere in the
+    # pipeline (corrections.py + metadata.py + build_windows_dataset.py +
+    # every primitives/*.py file) are loaded.
+    NEEDED_PAYLOAD_COLS = [
+        "payload_alpha", "payload_ax", "payload_ay", "payload_az", "payload_beta",
+        "payload_componentId", "payload_force", "payload_gamma", "payload_keyClass",
+        "payload_radiusX", "payload_radiusY", "payload_repeat", "payload_scrollTop",
+        "payload_taskType", "payload_x", "payload_xNorm", "payload_y", "payload_yNorm",
+    ]
+    NEEDED_COLS = [
+        "sessionId", "participantId", "deviceFamily", "kind", "tRelMs",
+        "taskId", "taskIndex", "activeArea",
+    ] + NEEDED_PAYLOAD_COLS
+
+    import pyarrow.parquet as pq
+    available = set(pq.ParquetFile(raw_path).schema_arrow.names)
+    cols = [c for c in NEEDED_COLS if c in available]
+    missing = set(NEEDED_COLS) - available
+    if missing:
+        print(f"[assembly] WARNING: columns referenced in code but absent from this "
+              f"parquet's schema: {sorted(missing)} -- affected features will be all-NaN, "
+              f"not an error, but worth checking if unexpected.")
+
+    raw = pd.read_parquet(raw_path, columns=cols)
     print(f"Loaded {len(raw):,} events across {raw['sessionId'].nunique()} sessions, "
-          f"{raw['participantId'].nunique()} participants.\n")
+          f"{raw['participantId'].nunique()} participants "
+          f"({len(cols)} of {len(available)} available columns).")
 
-    skeleton = build_skeleton(raw)
+    full_windows = build_full_dataset(raw)
 
-    print(f"\nSkeleton shape: {skeleton.shape}")
-    print(f"Columns: {list(skeleton.columns)}\n")
-
-    print("Afforded-flag coverage (fraction of windows in each state):")
-    for mod in MODALITY_KINDS:
-        vc = skeleton[f"{mod}_afforded"].value_counts(dropna=False)
-        print(f"  {mod}_afforded: {dict(vc)}")
-
-    print(f"\nDiagnostic-only task_boundary_straddle (any overlap with >1 task): "
-          f"{skeleton['task_boundary_straddle'].mean():.1%} of windows")
-
-    print("\nPer-modality straddle_conflict (window overlaps tasks that DISAGREE on "
-          "this modality's affordance -- this is what feature modules should actually "
-          "exclude on, not the blanket flag above):")
-    for mod in MODALITY_KINDS:
-        vc = skeleton[f"{mod}_straddle_conflict"].value_counts(dropna=False)
-        print(f"  {mod}_straddle_conflict: {dict(vc)}")
-
-    print("\nObserved-flag rate (fraction of windows with >=1 event):")
-    for mod in MODALITY_KINDS:
-        print(f"  {mod}_observed: {skeleton[f'{mod}_observed'].mean():.1%}")
-
-    print("\nSample rows:")
-    print(skeleton.head(8).to_string())
+    out_dir = Path("data/processed")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "windows.parquet"
+    full_windows.to_parquet(out_path, index=False)
+    print(f"\nWrote {out_path} ({full_windows.shape[0]:,} rows x {full_windows.shape[1]:,} columns)")
