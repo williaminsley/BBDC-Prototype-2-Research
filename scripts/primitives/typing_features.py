@@ -1,7 +1,7 @@
 """
 scripts/primitives/typing_features.py
 
-NOTE ON THE FILENAME: deliberately NOT typing.py -- shadows Python's own
+Note ON THE FILENAME: deliberately NOT typing.py -- shadows Python's own
 stdlib 'typing' module, breaking pandas/numpy imports. Confirmed directly.
 
 Typing feature family: event-level extraction ported from 04_behavioural_rhythm

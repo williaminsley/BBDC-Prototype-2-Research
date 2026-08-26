@@ -429,6 +429,19 @@ if __name__ == "__main__":
 
     out_dir = Path("data/processed")
     out_dir.mkdir(parents=True, exist_ok=True)
+
     out_path = out_dir / "windows.parquet"
     full_windows.to_parquet(out_path, index=False)
     print(f"\nWrote {out_path} ({full_windows.shape[0]:,} rows x {full_windows.shape[1]:,} columns)")
+
+    # CSV export for human viewing (Excel, quick grep, etc.) -- not needed by
+    # any downstream pipeline stage, which all read the parquet. Respects
+    # --skip-csv, matching build_raw_dataset.py's existing flag, which
+    # run_pipeline.sh already passes through to this script but which was
+    # never actually parsed until now.
+    if "--skip-csv" not in sys.argv:
+        csv_path = out_dir / "windows.csv"
+        full_windows.to_csv(csv_path, index=False)
+        print(f"Wrote {csv_path} ({csv_path.stat().st_size / 1e6:.1f} MB)")
+    else:
+        print("Skipped CSV export (--skip-csv)")
