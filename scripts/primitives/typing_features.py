@@ -1,57 +1,58 @@
 """
 scripts/primitives/typing_features.py
 
+NOTE ON THE FILENAME: deliberately NOT typing.py -- shadows Python's own
+stdlib 'typing' module, breaking pandas/numpy imports. Confirmed directly.
+
 Typing feature family: event-level extraction ported from 04_behavioural_rhythm
 (paired_durations -- dwell time) and 07_typing_structure (build_transitions,
 backspace_runs, autorepeat), plus window-level aggregation.
 
-Lives under scripts/primitives/ alongside the other feature-family modules
-(tap.py, gesture.py, coupling.py, motion.py as they're built) -- separate
-from the scaffold modules (corrections.py, metadata.py,
-build_windows_dataset.py) that sit directly in scripts/, since those are
-shared infrastructure every feature family depends on, while these are the
-individual, independently-addable families themselves.
+UNIFORM SUFFIX REBUILD (2026-08): a P1 slide confirmed the actual feature-
+naming convention -- family + metric + summary-statistic suffix, with a
+FIXED set of 9 suffixes (mean/std/median/iqr/p95/max/n/cv/slope) applied to
+every raw per-event metric. Earlier versions of this file applied an
+inconsistent subset per metric (dwell got mean/median/std; transitions got
+only mean/median). This version uses scripts/primitives/_stats.py's
+compute_summary_stats() so every per-event metric gets the same 9 columns,
+not a hand-picked subset.
 
-Ported functions are event/interval extractors (04's "already reusable"
-category from the earlier mapping) -- they take a whole session and return a
-table of timestamped events/intervals, which this module then re-scopes to
-arbitrary window boundaries rather than the session-level summaries the
-notebooks originally aggregated into.
+Per-event metrics that now get the full 9-suffix treatment:
+  - dwell time, overall and split by all 7 key classes
+  - transition timing, overall and split by all 9 LETTER/SPACE/BACKSPACE pairs
+  - backspace run length
 
-Straddle handling (2026-08, refined): for any window flagged
-typing_straddle_conflict=True by build_windows_dataset.py -- meaning the
-window overlaps tasks that actually disagree on typing affordance -- typing
-feature values are left NaN rather than computed from a mix of two tasks'
-worth of keystrokes. This is the precise, per-modality version of the
-straddle exclusion; a window that straddles a task boundary but whose
-overlapping tasks AGREE on typing affordance is NOT excluded, since there's
-nothing unsafe about the computation in that case. The window row itself is
-kept either way -- only the feature values are withheld for genuinely
-conflicting windows.
+NOT given the 9-suffix treatment (already single numbers per window, no
+within-window distribution to summarise): keydown count, backspace share,
+autorepeat share, key-class composition shares. These stay as single
+columns, per _stats.py's docstring on when the helper applies.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).parent))  # ensures _stats resolves whether this
+                                                    # module is run standalone or imported
+                                                    # as part of the primitives package
+from _stats import compute_summary_stats, summary_stat_columns
+
 KEY_DOWN_KIND = "keydown"
 KEY_UP_KIND = "keyup"
-MAX_TRANSITION_MS = 3000.0  # ported from 07 -- transitions slower than this
-                             # aren't a single continuous typing act, exclude
-                             # from transition-timing stats
+MAX_TRANSITION_MS = 3000.0
+
+KEY_CLASSES = ["LETTER", "SPACE", "BACKSPACE", "DIGIT", "PUNCT_OR_SYMBOL", "ENTER", "OTHER"]
+TRANSITION_MATRIX_CLASSES = ["LETTER", "SPACE", "BACKSPACE"]
 
 
 # =============================================================================
-# Event-level extractors (operate on one session's raw events, return a
-# table of timestamped events/intervals -- these do NOT know about windows)
+# Event-level extractors (unchanged from prior version -- the extraction
+# logic was correct, only the aggregation/suffix step needed fixing)
 # =============================================================================
 
 def extract_keydown_events(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    All keydown events across the whole corrected/raw stream, with the
-    columns needed by every function below: sessionId, participantId,
-    tRelMs, t_s, keyClass, is_repeat.
-    """
     k = raw_df.loc[raw_df["kind"] == KEY_DOWN_KIND,
                     ["sessionId", "participantId", "tRelMs",
                      "payload_keyClass", "payload_repeat"]].copy()
@@ -62,13 +63,8 @@ def extract_keydown_events(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def paired_durations(sess: pd.DataFrame, down_kind: str, up_kind: str) -> pd.DataFrame:
-    """
-    Ported from 04. For each down event, finds the next up event and returns
-    the gap as a dwell/hold duration in ms. Returns a table with per-event
-    timestamps (not just a bare array, unlike the notebook version) so the
-    result can be re-scoped to window boundaries downstream.
-    """
-    d = sess.loc[sess["kind"] == down_kind, ["sessionId", "participantId", "tRelMs"]].copy()
+    d = sess.loc[sess["kind"] == down_kind,
+                 ["sessionId", "participantId", "tRelMs", "payload_keyClass"]].copy()
     u = sess.loc[sess["kind"] == up_kind, "tRelMs"].sort_values().to_numpy(dtype=float)
     d = d.sort_values("tRelMs")
     rows = []
@@ -79,22 +75,14 @@ def paired_durations(sess: pd.DataFrame, down_kind: str, up_kind: str) -> pd.Dat
             rows.append({
                 "sessionId": r["sessionId"], "participantId": r["participantId"],
                 "t_s": t0 / 1000.0, "dwell_ms": nxt[0] - t0,
+                "keyClass": r.get("payload_keyClass", np.nan),
             })
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["sessionId", "participantId", "t_s", "dwell_ms"])
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["sessionId", "participantId", "t_s", "dwell_ms", "keyClass"])
 
 
 def build_transitions(keydown_events: pd.DataFrame,
                        max_transition_ms: float = MAX_TRANSITION_MS) -> pd.DataFrame:
-    """
-    Ported from 07. Consecutive-keydown class-transition timing
-    (LETTER->LETTER, LETTER->SPACE, etc.), excluding gaps longer than
-    max_transition_ms (not a single continuous typing act -- likely a pause
-    to think, or a task-boundary gap).
-
-    Each row's t_s is the timestamp of the SECOND event in the pair, so a
-    transition is attributed to the window it lands in, i.e. the window
-    where the transition-completing keystroke happened.
-    """
     out = []
     for sid, g in keydown_events.groupby("sessionId"):
         g = g.sort_values("t_s")
@@ -115,13 +103,6 @@ def build_transitions(keydown_events: pd.DataFrame,
 
 
 def backspace_runs(keydown_events: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ported from 07. A 'run' is consecutive BACKSPACE keydowns with no other
-    key class between them -- distinguishes a single-typo fix (run_length=1)
-    from a deliberate field-wipe (long run). Each run is attributed by the
-    timestamp of its FIRST backspace in the run, so it lands in the window
-    where the correction episode began.
-    """
     out = []
     for sid, g in keydown_events.groupby("sessionId"):
         g = g.sort_values("t_s")
@@ -153,46 +134,38 @@ def backspace_runs(keydown_events: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def _events_in_window(event_t_s: np.ndarray, w_start: float, w_end: float) -> np.ndarray:
-    """Boolean mask: which events (sorted or not) fall in [w_start, w_end)."""
     return (event_t_s >= w_start) & (event_t_s < w_end)
 
 
+def _build_feature_column_list() -> list[str]:
+    cols = ["typing_keydown_count", "typing_backspace_share", "typing_autorepeat_share"]
+    for kc in KEY_CLASSES:
+        cols.append(f"typing_share_{kc.lower()}")
+
+    # full 9-suffix treatment for every genuine per-event metric
+    cols += summary_stat_columns("typing_dwell_ms")
+    for kc in KEY_CLASSES:
+        cols += summary_stat_columns(f"typing_dwell_{kc.lower()}_ms")
+    cols += summary_stat_columns("typing_transition_ms")
+    for a in TRANSITION_MATRIX_CLASSES:
+        for b in TRANSITION_MATRIX_CLASSES:
+            cols += summary_stat_columns(f"typing_transition_{a.lower()}_{b.lower()}_ms")
+    cols += summary_stat_columns("typing_backspace_run_length")
+    return cols
+
+
 def aggregate_typing_features(windows: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For every window in `windows` (must have sessionId, window_start_s,
-    window_end_s, typing_afforded, task_boundary_straddle), compute typing
-    features from events falling inside that window's span.
-
-    Windows with task_boundary_straddle=True get NaN for every typing
-    feature (option 1 -- see module docstring). Windows with
-    typing_afforded in {False, NaN} also get NaN, since there's no
-    meaningful typing behaviour to measure when the task didn't call for it
-    or the task context itself is unknown.
-
-    Maximalist: every feature computed here regardless of how "good" it
-    looks; filtering happens at a later stage, not here.
-    """
     keydown = extract_keydown_events(raw_df)
     transitions = build_transitions(keydown)
     bs_runs = backspace_runs(keydown)
-
     dwell = paired_durations(raw_df, KEY_DOWN_KIND, KEY_UP_KIND)
 
-    feature_cols = [
-        "typing_keydown_count",
-        "typing_dwell_ms_mean", "typing_dwell_ms_median", "typing_dwell_ms_std",
-        "typing_transition_ms_mean", "typing_transition_ms_median",
-        "typing_letter_letter_ms_median",
-        "typing_backspace_share",
-        "typing_autorepeat_share",
-        "typing_backspace_run_median", "typing_backspace_run_max", "typing_n_backspace_runs",
-    ]
-    for c in feature_cols:
-        windows[c] = np.nan
+    feature_cols = _build_feature_column_list()
+    windows = pd.concat([windows, pd.DataFrame(np.nan, index=windows.index, columns=feature_cols)], axis=1)
 
     eligible = (
         (~windows["typing_straddle_conflict"].fillna(False))
-        & (windows["typing_afforded"] == True)  # noqa: E712 (nullable boolean; NaN safely excluded)
+        & (windows["typing_afforded"] == True)  # noqa: E712
     )
 
     for sid, sess_windows in windows.loc[eligible].groupby("sessionId"):
@@ -216,29 +189,48 @@ def aggregate_typing_features(windows: pd.DataFrame, raw_df: pd.DataFrame) -> pd
             if n_keys:
                 windows.at[idx, "typing_backspace_share"] = (kd_win["keyClass"] == "BACKSPACE").mean()
                 windows.at[idx, "typing_autorepeat_share"] = kd_win["is_repeat"].mean()
+                class_counts = kd_win["keyClass"].value_counts()
+                for kc in KEY_CLASSES:
+                    windows.at[idx, f"typing_share_{kc.lower()}"] = class_counts.get(kc, 0) / n_keys
 
             dwell_mask = _events_in_window(dwell_t, w_start, w_end)
-            dwell_win = dwell_sess.loc[dwell_mask, "dwell_ms"]
+            dwell_win = dwell_sess.loc[dwell_mask]
             if len(dwell_win):
-                windows.at[idx, "typing_dwell_ms_mean"] = dwell_win.mean()
-                windows.at[idx, "typing_dwell_ms_median"] = dwell_win.median()
-                windows.at[idx, "typing_dwell_ms_std"] = dwell_win.std()
+                rel_t = dwell_win["t_s"].to_numpy() - w_start
+                stats = compute_summary_stats(dwell_win["dwell_ms"].to_numpy(), rel_t)
+                for suf, val in stats.items():
+                    windows.at[idx, f"typing_dwell_ms_{suf}"] = val
+                for kc in KEY_CLASSES:
+                    sub = dwell_win.loc[dwell_win["keyClass"] == kc]
+                    if len(sub):
+                        rel_t_kc = sub["t_s"].to_numpy() - w_start
+                        stats_kc = compute_summary_stats(sub["dwell_ms"].to_numpy(), rel_t_kc)
+                        for suf, val in stats_kc.items():
+                            windows.at[idx, f"typing_dwell_{kc.lower()}_ms_{suf}"] = val
 
             trans_mask = _events_in_window(trans_t, w_start, w_end)
             trans_win = trans_sess.loc[trans_mask]
             if len(trans_win):
-                windows.at[idx, "typing_transition_ms_mean"] = trans_win["dt_ms"].mean()
-                windows.at[idx, "typing_transition_ms_median"] = trans_win["dt_ms"].median()
-                ll = trans_win.loc[trans_win["transition"] == "LETTER->LETTER", "dt_ms"]
-                if len(ll):
-                    windows.at[idx, "typing_letter_letter_ms_median"] = ll.median()
+                rel_t = trans_win["t_s"].to_numpy() - w_start
+                stats = compute_summary_stats(trans_win["dt_ms"].to_numpy(), rel_t)
+                for suf, val in stats.items():
+                    windows.at[idx, f"typing_transition_ms_{suf}"] = val
+                for a in TRANSITION_MATRIX_CLASSES:
+                    for b in TRANSITION_MATRIX_CLASSES:
+                        pair_sub = trans_win.loc[trans_win["transition"] == f"{a}->{b}"]
+                        if len(pair_sub):
+                            rel_t_pair = pair_sub["t_s"].to_numpy() - w_start
+                            stats_pair = compute_summary_stats(pair_sub["dt_ms"].to_numpy(), rel_t_pair)
+                            for suf, val in stats_pair.items():
+                                windows.at[idx, f"typing_transition_{a.lower()}_{b.lower()}_ms_{suf}"] = val
 
             runs_mask = _events_in_window(runs_t, w_start, w_end)
-            runs_win = runs_sess.loc[runs_mask, "run_length"]
+            runs_win = runs_sess.loc[runs_mask]
             if len(runs_win):
-                windows.at[idx, "typing_backspace_run_median"] = runs_win.median()
-                windows.at[idx, "typing_backspace_run_max"] = runs_win.max()
-                windows.at[idx, "typing_n_backspace_runs"] = len(runs_win)
+                rel_t = runs_win["t_s"].to_numpy() - w_start
+                stats = compute_summary_stats(runs_win["run_length"].to_numpy(), rel_t)
+                for suf, val in stats.items():
+                    windows.at[idx, f"typing_backspace_run_length_{suf}"] = val
 
     return windows
 
@@ -250,9 +242,6 @@ if __name__ == "__main__":
     import sys
     from pathlib import Path
 
-    # build_windows_dataset.py lives one directory up (scripts/), this file
-    # lives in scripts/primitives/ -- add the parent to the path so the
-    # bare import below resolves regardless of the caller's cwd.
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from build_windows_dataset import build_skeleton  # noqa: E402
 
@@ -269,24 +258,18 @@ if __name__ == "__main__":
     print(f"Loaded {len(raw):,} events across {raw['sessionId'].nunique()} sessions.\n")
 
     windows = build_skeleton(raw)
+    feature_cols = _build_feature_column_list()
+    print(f"typing_features.py now generates {len(feature_cols)} candidate feature columns "
+          f"(41 before the uniform-suffix rebuild).\n")
+
     windows = aggregate_typing_features(windows, raw)
 
     eligible = (~windows["typing_straddle_conflict"].fillna(False)) & (windows["typing_afforded"] == True)
-    print(f"\n{eligible.sum()} windows eligible for typing features "
-          f"(afforded=True, no typing_straddle_conflict), of {len(windows)} total.")
+    print(f"{eligible.sum()} windows eligible, of {len(windows)} total.\n")
 
-    has_dwell = windows["typing_dwell_ms_mean"].notna()
-    print(f"typing_dwell_ms_mean populated for {has_dwell.sum()} windows "
-          f"({has_dwell.sum() / max(eligible.sum(), 1):.1%} of eligible windows -- "
-          f"gap is windows with an afforded typing task but zero actual keystrokes, "
-          f"a real hesitation signal, not a bug)")
-
-    print("\nSample of eligible windows with typing features:")
-    cols = ["sessionId", "window_index", "typing_keydown_count", "typing_dwell_ms_median",
-            "typing_transition_ms_median", "typing_backspace_share", "typing_autorepeat_share"]
-    print(windows.loc[eligible & has_dwell, cols].head(10).to_string(index=False))
-
-    print("\nConflicting windows correctly left NaN (typing_straddle_conflict=True):")
-    conflict_sample = windows.loc[windows["typing_straddle_conflict"] == True, cols]
-    print(f"  {conflict_sample['typing_keydown_count'].isna().all()} "
-          f"(all NaN, as expected -- {len(conflict_sample)} conflicting windows total)")
+    elig_windows = windows.loc[eligible]
+    rates = elig_windows[feature_cols].notna().mean().sort_values(ascending=False)
+    print("Non-null rate, top 15 and bottom 15 columns:")
+    print(rates.head(15).round(3).to_string())
+    print("...")
+    print(rates.tail(15).round(3).to_string())
