@@ -7,7 +7,8 @@
 #   1. sync      sync_sessions_p2.py        Firebase -> data/raw/sessions/{sessionId}/
 #   2. validate  validate_raw_sessions.py   PASS/WARN/FAIL report per session
 #   3. raw       build_raw_dataset.py       canonical raw events (one row per event)
-#   4. windows   build_windows_dataset.py   7.5s/2.5s sliding windows + features
+#   4. windows   build_windows_dataset.py   15s/7.5s sliding windows + features
+#   5. qc        run_qc.py                  structural QC gate on the windowed dataset
 #
 # Halt semantics are deliberately not uniform across stages, because the scripts
 # do not mean the same thing by a non-zero exit:
@@ -23,6 +24,12 @@
 #     gate. That is the real "nothing usable" condition, and it halts the run.
 #
 #   - sync and windows failures halt the run.
+#
+#   - run_qc.py exits 1 on any HARD FAIL (see scripts/run_qc.py for the
+#     severity definitions) and 0 otherwise, including when it has soft
+#     warnings -- so a QC run with only warnings does not halt the pipeline,
+#     matching build_windows_dataset.py's completion being what "done"
+#     means; qc is a check on that output, not a build step in its own right.
 #
 # Usage:
 #   ./run_pipeline.sh                    full run
@@ -59,7 +66,7 @@ REPORTS_DIR="reports"
 LOGS_DIR="reports/logs"
 VALIDATION_REPORT="${REPORTS_DIR}/session_export_validation_p2.json"
 
-ALL_STAGES=(sync validate raw windows)
+ALL_STAGES=(sync validate raw windows qc)
 START_STAGE="sync"
 SKIP_CSV=0
 
@@ -70,7 +77,7 @@ usage() {
 run_pipeline.sh - BBDC Prototype 2 research pipeline runner
 
   --skip-sync        Skip the Firebase sync; use sessions already on disk.
-  --from STAGE       Start at STAGE. One of: sync, validate, raw, windows.
+  --from STAGE       Start at STAGE. One of: sync, validate, raw, windows, qc.
   --skip-csv         Pass --skip-csv to the raw and windows builds
                      (parquet only; skips the large, slow CSV copies).
   -h, --help         Show this message.
@@ -186,11 +193,11 @@ else
 fi
 
 for stage_script in sync_sessions_p2.py validate_raw_sessions.py \
-                    build_raw_dataset.py build_windows_dataset.py; do
+                    build_raw_dataset.py build_windows_dataset.py run_qc.py; do
     [[ -f "${SCRIPTS_DIR}/${stage_script}" ]] \
         || fail preflight "Missing ${SCRIPTS_DIR}/${stage_script}"
 done
-echo "scripts   : all four present in ${SCRIPTS_DIR}/"
+echo "scripts   : all five present in ${SCRIPTS_DIR}/"
 
 "$PYTHON" - <<'PY' || fail preflight "Core dependencies missing. Run: pip install -r requirements.txt"
 import sys
@@ -236,20 +243,20 @@ echo "PREFLIGHT OK"
 # --------------------------------------------------------- 1. sync ---------
 
 if should_run sync; then
-    banner "STAGE 1/4  sync  (sync_sessions_p2.py)"
+    banner "STAGE 1/5  sync  (sync_sessions_p2.py)"
     T0=$SECONDS
     "$PYTHON" "${SCRIPTS_DIR}/sync_sessions_p2.py" \
         || fail sync "sync_sessions_p2.py exited non-zero (missing credentials, or at least one session failed to download). Fix the cause, or re-run with --skip-sync to build from what is already on disk."
     stage_done "sync" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 1/4  sync ----"
+    echo "---- SKIPPED stage 1/5  sync ----"
 fi
 
 # ------------------------------------------------------ 2. validate --------
 
 if should_run validate; then
-    banner "STAGE 2/4  validate  (validate_raw_sessions.py)"
+    banner "STAGE 2/5  validate  (validate_raw_sessions.py)"
     T0=$SECONDS
 
     # Remove any previous run's report first. Otherwise, if this run's validate
@@ -328,13 +335,13 @@ PY
     stage_done "validate" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 2/4  validate ----"
+    echo "---- SKIPPED stage 2/5  validate ----"
 fi
 
 # ----------------------------------------------------------- 3. raw --------
 
 if should_run raw; then
-    banner "STAGE 3/4  raw  (build_raw_dataset.py)"
+    banner "STAGE 3/5  raw  (build_raw_dataset.py)"
     T0=$SECONDS
     # Exits 1 only when no session survived the structural gate - the real
     # "nothing usable" condition. Per-session EXCLUDED lines are printed above.
@@ -343,20 +350,39 @@ if should_run raw; then
     stage_done "raw" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 3/4  raw ----"
+    echo "---- SKIPPED stage 3/5  raw ----"
 fi
 
 # ------------------------------------------------------- 4. windows --------
 
 if should_run windows; then
-    banner "STAGE 4/4  windows  (build_windows_dataset.py)"
+    banner "STAGE 4/5  windows  (build_windows_dataset.py)"
     T0=$SECONDS
     "$PYTHON" "${SCRIPTS_DIR}/build_windows_dataset.py" $CSV_FLAG \
         || fail windows "build_windows_dataset.py exited non-zero. If it reported 'No windows produced', every session was shorter than one window length."
     stage_done "windows" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 4/4  windows ----"
+    echo "---- SKIPPED stage 4/5  windows ----"
+fi
+
+# ------------------------------------------------------------ 5. qc --------
+
+if should_run qc; then
+    banner "STAGE 5/5  qc  (run_qc.py)"
+    T0=$SECONDS
+    # run_qc.py exits 1 on any HARD FAIL, 0 otherwise (soft warnings included).
+    # Its full report goes to stdout, which this pipeline already captures via
+    # the tee at the bottom of the file -- no separate report file to check for,
+    # unlike validate's JSON report, since qc has nothing analogous to
+    # validate's "keep going with the good sessions" partial-continuation logic:
+    # the windowed dataset either passes structural QC as a whole or it does not.
+    "$PYTHON" "${SCRIPTS_DIR}/run_qc.py" \
+        || fail qc "run_qc.py reported a HARD FAIL against data/processed/windows.parquet. See the QC report above for which check(s) failed."
+    stage_done "qc" "$T0"
+else
+    echo
+    echo "---- SKIPPED stage 5/5  qc ----"
 fi
 
 # ---------------------------------------------------------------- done -----
