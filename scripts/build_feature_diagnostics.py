@@ -92,6 +92,20 @@ COUNT_LIKE_EXACT = {
 NEAR_EMPTY_THRESHOLD = 0.01          # <1% populated, matches nb12's audit
 MIN_GROUP_N = 5                      # a device-model/ctx group needs this many
                                       # non-null obs before its std is trusted
+MIN_INFORMATIVE_WINDOWS = 20         # a feature must vary in at least this many
+                                      # windows before the grouped lock/assoc
+                                      # test is meaningful. Added 2026-09 after
+                                      # typing_autorepeat_share was flagged
+                                      # device-locked with assoc=inf: it is
+                                      # non-zero in only 6 of 2,962 windows, so
+                                      # nearly every device-model group has
+                                      # exactly zero internal variance BY
+                                      # CONSTRUCTION and the between/within
+                                      # ratio explodes. That is a rare event
+                                      # being mistaken for a device
+                                      # fingerprint -- the same sparsity trap
+                                      # already fixed in the separation-ratio
+                                      # and correlation checks, recurring here.
 DEVICE_LOCK_ASSOC_THRESHOLD = 3.0    # between-group std / within-group std
 DEVICE_LOCK_WITHIN_RATIO = 0.40      # AND median within-group std must be
                                       # < 40% of the feature's overall std.
@@ -217,12 +231,23 @@ def _grouped_lock_check(df: pd.DataFrame, feature: str, group_col: str) -> dict:
     group variable (device model, fatigue level, etc.), not behaviour."""
     sub = df[[group_col, feature]].dropna()
     if sub[group_col].nunique() < 2:
-        return {"assoc": np.nan, "locked": False}
+        return {"assoc": np.nan, "locked": False, "assessable": False}
+
+    # Guard against near-constant features (see MIN_INFORMATIVE_WINDOWS).
+    # Reported as NOT ASSESSABLE rather than as "not locked": those are
+    # different claims, and this layer only screens -- it should never
+    # assert an answer it cannot support. The decision layer
+    # (build_behavioural_dataset.py) treats unknown as its own case.
+    vals = sub[feature]
+    if len(vals):
+        mode_vals = vals.mode()
+        if len(mode_vals) and int((vals != mode_vals.iloc[0]).sum()) < MIN_INFORMATIVE_WINDOWS:
+            return {"assoc": np.nan, "locked": False, "assessable": False}
 
     grouped = sub.groupby(group_col)[feature].agg(["mean", "std", "count"])
     well_supported = grouped[grouped["count"] >= MIN_GROUP_N]
     if len(well_supported) < 2:
-        return {"assoc": np.nan, "locked": False}
+        return {"assoc": np.nan, "locked": False, "assessable": False}
 
     between = well_supported["mean"].std()
     # Median, not mean, across group stds -- deliberately robust to a
@@ -236,7 +261,7 @@ def _grouped_lock_check(df: pd.DataFrame, feature: str, group_col: str) -> dict:
     overall_std = sub[feature].std()
 
     if pd.isna(between) or pd.isna(overall_std) or overall_std <= 0:
-        return {"assoc": np.nan, "locked": False}
+        return {"assoc": np.nan, "locked": False, "assessable": False}
 
     if within <= 0:
         # Majority of groups have exactly zero internal variance (like
@@ -245,18 +270,19 @@ def _grouped_lock_check(df: pd.DataFrame, feature: str, group_col: str) -> dict:
         # that alone is the strongest possible lock signal, so flag it
         # directly rather than dividing by zero or discarding the case.
         locked = bool(between > 0)
-        return {"assoc": np.inf if locked else np.nan, "locked": locked}
+        return {"assoc": np.inf if locked else np.nan, "locked": locked, "assessable": True}
 
     assoc = between / within
     locked = bool(assoc >= DEVICE_LOCK_ASSOC_THRESHOLD and (within / overall_std) < DEVICE_LOCK_WITHIN_RATIO)
-    return {"assoc": round(float(assoc), 3), "locked": locked}
+    return {"assoc": round(float(assoc), 3), "locked": locked, "assessable": True}
 
 
 def compute_device_lock(df: pd.DataFrame, feature: str) -> dict:
     result = _grouped_lock_check(df, feature, "deviceModel")
     return {
         "device_model_assoc": result["assoc"],
-        "is_device_locked": result["locked"],
+        "is_device_locked": result["locked"] if result["assessable"] else np.nan,
+        "device_lock_assessable": result["assessable"],
     }
 
 
@@ -366,7 +392,8 @@ def build_feature_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
     # columns -- just a fast way to triage.
     out["needs_review"] = (
         out["is_fully_empty"] | out["is_near_empty"] | out["is_count_like"]
-        | out["high_exposure_corr"] | out["is_device_locked"] | out["high_ctx_assoc"]
+        | out["high_exposure_corr"] | out["is_device_locked"].fillna(False).astype(bool)
+        | out["high_ctx_assoc"]
         | out["known_issue"].notna()
     )
 
@@ -375,7 +402,7 @@ def build_feature_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
         "non_null_pct_overall", "is_fully_empty", "is_near_empty",
         "n_participants_any_data", "min_participant_non_null_pct",
         "is_count_like", "corr_with_participant_n_windows", "high_exposure_corr",
-        "device_model_assoc", "is_device_locked",
+        "device_model_assoc", "is_device_locked", "device_lock_assessable",
         "max_ctx_assoc", "which_ctx_col", "high_ctx_assoc",
         "max_abs_corr", "max_abs_corr_with",
         "known_issue", "needs_review",

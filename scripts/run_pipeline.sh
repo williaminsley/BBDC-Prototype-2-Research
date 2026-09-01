@@ -77,11 +77,12 @@ cd "$REPO_ROOT"
 
 PYTHON="${PYTHON:-python3}"
 SCRIPTS_DIR="scripts"
+MODELLING_DIR="scripts/modelling"
 REPORTS_DIR="reports"
 LOGS_DIR="reports/logs"
 VALIDATION_REPORT="${REPORTS_DIR}/session_export_validation_p2.json"
 
-ALL_STAGES=(sync validate raw windows qc diagnostics behavioural)
+ALL_STAGES=(sync validate raw windows qc diagnostics behavioural modality splits trust)
 START_STAGE="sync"
 SKIP_CSV=0
 
@@ -92,7 +93,8 @@ usage() {
 run_pipeline.sh - BBDC Prototype 2 research pipeline runner
 
   --skip-sync        Skip the Firebase sync; use sessions already on disk.
-  --from STAGE       Start at STAGE. One of: sync, validate, raw, windows, qc, diagnostics, behavioural.
+  --from STAGE       Start at STAGE. One of: sync, validate, raw, windows, qc,
+                     diagnostics, behavioural, modality, splits, trust.
   --skip-csv         Pass --skip-csv to the raw and windows builds
                      (parquet only; skips the large, slow CSV copies).
   -h, --help         Show this message.
@@ -213,7 +215,12 @@ for stage_script in sync_sessions_p2.py validate_raw_sessions.py \
     [[ -f "${SCRIPTS_DIR}/${stage_script}" ]] \
         || fail preflight "Missing ${SCRIPTS_DIR}/${stage_script}"
 done
-echo "scripts   : all seven present in ${SCRIPTS_DIR}/"
+for modelling_script in build_modality_datasets.py build_identity_splits.py \
+                        evaluate_trust_windows.py; do
+    [[ -f "${MODELLING_DIR}/${modelling_script}" ]] \
+        || fail preflight "Missing ${MODELLING_DIR}/${modelling_script}"
+done
+echo "scripts   : all seven pipeline + three modelling scripts present"
 
 "$PYTHON" - <<'PY' || fail preflight "Core dependencies missing. Run: pip install -r requirements.txt"
 import sys
@@ -259,20 +266,20 @@ echo "PREFLIGHT OK"
 # --------------------------------------------------------- 1. sync ---------
 
 if should_run sync; then
-    banner "STAGE 1/7  sync  (sync_sessions_p2.py)"
+    banner "STAGE 1/10  sync  (sync_sessions_p2.py)"
     T0=$SECONDS
     "$PYTHON" "${SCRIPTS_DIR}/sync_sessions_p2.py" \
         || fail sync "sync_sessions_p2.py exited non-zero (missing credentials, or at least one session failed to download). Fix the cause, or re-run with --skip-sync to build from what is already on disk."
     stage_done "sync" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 1/7  sync ----"
+    echo "---- SKIPPED stage 1/10  sync ----"
 fi
 
 # ------------------------------------------------------ 2. validate --------
 
 if should_run validate; then
-    banner "STAGE 2/7  validate  (validate_raw_sessions.py)"
+    banner "STAGE 2/10  validate  (validate_raw_sessions.py)"
     T0=$SECONDS
 
     # Remove any previous run's report first. Otherwise, if this run's validate
@@ -351,13 +358,13 @@ PY
     stage_done "validate" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 2/7  validate ----"
+    echo "---- SKIPPED stage 2/10  validate ----"
 fi
 
 # ----------------------------------------------------------- 3. raw --------
 
 if should_run raw; then
-    banner "STAGE 3/7  raw  (build_raw_dataset.py)"
+    banner "STAGE 3/10  raw  (build_raw_dataset.py)"
     T0=$SECONDS
     # Exits 1 only when no session survived the structural gate - the real
     # "nothing usable" condition. Per-session EXCLUDED lines are printed above.
@@ -366,26 +373,26 @@ if should_run raw; then
     stage_done "raw" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 3/7  raw ----"
+    echo "---- SKIPPED stage 3/10  raw ----"
 fi
 
 # ------------------------------------------------------- 4. windows --------
 
 if should_run windows; then
-    banner "STAGE 4/7  windows  (build_windows_dataset.py)"
+    banner "STAGE 4/10  windows  (build_windows_dataset.py)"
     T0=$SECONDS
     "$PYTHON" "${SCRIPTS_DIR}/build_windows_dataset.py" $CSV_FLAG \
         || fail windows "build_windows_dataset.py exited non-zero. If it reported 'No windows produced', every session was shorter than one window length."
     stage_done "windows" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 4/7  windows ----"
+    echo "---- SKIPPED stage 4/10  windows ----"
 fi
 
 # ------------------------------------------------------------ 5. qc --------
 
 if should_run qc; then
-    banner "STAGE 5/7  qc  (run_qc.py)"
+    banner "STAGE 5/10  qc  (run_qc.py)"
     T0=$SECONDS
     # run_qc.py exits 1 on any HARD FAIL, 0 otherwise (soft warnings included).
     # Its full report goes to stdout, which this pipeline already captures via
@@ -398,13 +405,13 @@ if should_run qc; then
     stage_done "qc" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 5/7  qc ----"
+    echo "---- SKIPPED stage 5/10  qc ----"
 fi
 
 # ------------------------------------------------------ 6. diagnostics -----
 
 if should_run diagnostics; then
-    banner "STAGE 6/7  diagnostics  (build_feature_diagnostics.py)"
+    banner "STAGE 6/10  diagnostics  (build_feature_diagnostics.py)"
     T0=$SECONDS
     # Straightforward build step, same halt semantics as windows: reads
     # data/processed/windows.parquet, writes feature_diagnostics.csv/.parquet.
@@ -414,13 +421,13 @@ if should_run diagnostics; then
     stage_done "diagnostics" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 6/7  diagnostics ----"
+    echo "---- SKIPPED stage 6/10  diagnostics ----"
 fi
 
 # ------------------------------------------------------ 7. behavioural -----
 
 if should_run behavioural; then
-    banner "STAGE 7/7  behavioural  (build_behavioural_dataset.py)"
+    banner "STAGE 7/10  behavioural  (build_behavioural_dataset.py)"
     T0=$SECONDS
     # Straightforward build step, same halt semantics as diagnostics/windows:
     # reads data/processed/windows.parquet + feature_diagnostics.csv/.parquet,
@@ -432,7 +439,53 @@ if should_run behavioural; then
     stage_done "behavioural" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 7/7  behavioural ----"
+    echo "---- SKIPPED stage 7/10  behavioural ----"
+fi
+
+# --------------------------------------------------------- 8. modality -----
+# Stages 8-10 are MODELLING, not data preparation: they live in
+# scripts/modelling/ and consume the data-prep output rather than producing
+# canonical datasets. They are wired in here so a full run reproduces the
+# whole chain end to end, but --from modality is the usual entry point when
+# iterating on modelling without rebuilding the raw/windows layers.
+
+if should_run modality; then
+    banner "STAGE 8/10  modality  (build_modality_datasets.py)"
+    T0=$SECONDS
+    "$PYTHON" "${MODELLING_DIR}/build_modality_datasets.py" \
+        || fail modality "build_modality_datasets.py exited non-zero. Check that data/processed/behavioural_windows_candidate.parquet exists (the behavioural stage must have completed first)."
+    stage_done "modality" "$T0"
+else
+    echo
+    echo "---- SKIPPED stage 8/10  modality ----"
+fi
+
+# ----------------------------------------------------------- 9. splits -----
+
+if should_run splits; then
+    banner "STAGE 9/10  splits  (build_identity_splits.py)"
+    T0=$SECONDS
+    "$PYTHON" "${MODELLING_DIR}/build_identity_splits.py" \
+        || fail splits "build_identity_splits.py exited non-zero. Note this script deliberately HARD-FAILS if sessionIndex is ambiguous within a participant (duplicate values), since enrol/probe assignment cannot be made safely in that case -- that is a real data problem to investigate, not a bug to work around."
+    stage_done "splits" "$T0"
+else
+    echo
+    echo "---- SKIPPED stage 9/10  splits ----"
+fi
+
+# ----------------------------------------------------------- 10. trust -----
+
+if should_run trust; then
+    banner "STAGE 10/10  trust  (evaluate_trust_windows.py)"
+    T0=$SECONDS
+    # Baseline evaluation, not a trained model -- establishes the floor a
+    # learned embedder has to beat on an identical harness.
+    "$PYTHON" "${MODELLING_DIR}/evaluate_trust_windows.py" \
+        || fail trust "evaluate_trust_windows.py exited non-zero. Requires data/processed/modelling/identity_splits.csv and the per-modality window tables (stages 8 and 9)."
+    stage_done "trust" "$T0"
+else
+    echo
+    echo "---- SKIPPED stage 10/10  trust ----"
 fi
 
 # ---------------------------------------------------------------- done -----
@@ -450,6 +503,9 @@ for f in data/processed/raw_events.parquet \
          data/processed/feature_diagnostics.parquet \
          data/processed/behavioural_windows_candidate.csv \
          data/processed/behavioural_windows_candidate.parquet \
+         data/processed/modelling/identity_splits.csv \
+         data/processed/modelling/tap_windows.parquet \
+         data/processed/modelling/trust_window_results.csv \
          "$VALIDATION_REPORT"; do
     if [[ -f "$f" ]]; then
         echo "    $(du -h "$f" | cut -f1)	$f"

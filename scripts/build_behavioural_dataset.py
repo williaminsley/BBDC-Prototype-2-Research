@@ -94,13 +94,67 @@ CONTEXT_COLS = [
 # and only among features that already survived every other rule (see
 # resolve_duplicates()), since flagging a dedup reason on a column already
 # being dropped for being empty would be noise, not information.
+# Feature families excluded by explicit DECISION, independent of what any
+# threshold-based detector happens to flag on a given data refresh.
+#
+# WHY THIS EXISTS (2026-09): tap_radiusX / tap_radiusY / tap_force were
+# investigated and confirmed to be device/API artifacts rather than
+# behaviour -- radiusY is exactly 0 for ~95% of newer-iPhone windows (an
+# unsupported WebKit field), and radiusX/force are row-level IDENTICAL on
+# 90%+ of iPhone rows, i.e. two supposedly independent measurements
+# reporting one shared fallback value. The decision was to drop all three
+# families entirely.
+#
+# That decision was originally left to the is_device_locked flag to
+# enforce, which was a mistake: that flag is a threshold-based empirical
+# test recomputed on every run, and it only ever caught the
+# central-tendency statistics (mean/median/p95/max) where the between-model
+# gap is stark. The spread statistics (std/iqr/cv/slope) of the SAME broken
+# measurement did not trip it. Verified on the 85-session export: only 12
+# of the 27 columns across these three families were flagged, so 15 leaked
+# into the model-input set -- including tap_force_median, which then showed
+# up in an anomaly investigation and was briefly interpreted as a real
+# change in how hard someone was pressing.
+#
+# A decision that has been made deliberately should be enforced
+# deliberately, not re-derived from data each run.
+HARD_EXCLUDED_PREFIXES = (
+    "tap_radiusX", "tap_radiusY", "tap_force",
+    # tap_cells_touched is a raw count; tap_coverage is that same count
+    # divided by a constant (cells / 64), so it is algebraically the same
+    # information rescaled. Both were decided against. Listed here rather
+    # than left to the count-like and duplicate rules to catch, because
+    # tap_coverage's removal otherwise depends on its correlation with
+    # tap_cells_touched evaluating to EXACTLY 1.0 -- a data-driven test
+    # standing in for a decision already made, which is precisely how the
+    # tap_force spread statistics survived a decision to drop them.
+    "tap_cells_touched", "tap_coverage",
+)
+
 EXCLUSION_PRIORITY = [
     ("is_fully_empty", "fully_empty"),
     ("is_near_empty", "near_empty"),
     ("is_count_like", "count_like"),
     ("high_exposure_corr", "high_exposure_corr"),
-    ("is_device_locked", "device_locked"),
 ]
+
+# is_device_locked is deliberately NOT in EXCLUSION_PRIORITY above.
+#
+# Automatically dropping on that flag has now produced errors in BOTH
+# directions on this project: tap_force's spread statistics were kept
+# despite an explicit decision to drop the family (the threshold only
+# caught the central-tendency statistics), and typing_autorepeat_share was
+# dropped despite being investigated and cleared (it is non-zero in 6 of
+# 2,962 windows, so the grouped test was measuring sparsity, not device).
+#
+# Families that have actually been decided on are hard-excluded above.
+# Whatever the detector flags beyond that is now surfaced as a short
+# review list and KEPT in the dataset, rather than silently removed -- the
+# diagnostics table is a screening aid, so a flag from it should prompt a
+# look, not act as a verdict. Features whose lock status could not be
+# assessed at all (device_lock_assessable == False) are likewise not
+# treated as evidence of anything.
+DEVICE_LOCK_REVIEW_REASON = "device_locked_needs_manual_review"
 
 
 # =============================================================================
@@ -114,6 +168,13 @@ def apply_diagnostic_exclusions(diag: pd.DataFrame) -> pd.DataFrame:
     diag = diag.copy()
     diag["decision"] = "keep"
     diag["decision_reason"] = "kept"
+
+    # Applied FIRST, ahead of every data-driven rule, so the reason recorded
+    # is the actual reason (an explicit decision) rather than whichever
+    # detector happened to also catch it this run.
+    hard = diag["feature"].str.startswith(HARD_EXCLUDED_PREFIXES)
+    diag.loc[hard, "decision"] = "drop"
+    diag.loc[hard, "decision_reason"] = "hard_excluded_family"
 
     for flag_col, reason in EXCLUSION_PRIORITY:
         still_kept = diag["decision"] == "keep"
@@ -224,10 +285,25 @@ def resolve_duplicates_of_dropped(diag: pd.DataFrame) -> pd.DataFrame:
     return diag
 
 
+def flag_device_lock_for_review(diag: pd.DataFrame) -> pd.DataFrame:
+    """Mark surviving features the device-lock detector flagged, without
+    dropping them. See DEVICE_LOCK_REVIEW_REASON for why this is a review
+    list rather than an exclusion rule."""
+    diag = diag.copy()
+    diag["needs_manual_review"] = False
+    if "is_device_locked" not in diag.columns:
+        return diag
+    flagged = diag["is_device_locked"].fillna(False).astype(bool) & (diag["decision"] == "keep")
+    diag.loc[flagged, "needs_manual_review"] = True
+    diag.loc[flagged, "decision_reason"] = DEVICE_LOCK_REVIEW_REASON
+    return diag
+
+
 def build_behavioural_dataset(windows: pd.DataFrame, diag: pd.DataFrame):
     diag = apply_diagnostic_exclusions(diag)
     diag = resolve_duplicates(diag)
     diag = resolve_duplicates_of_dropped(diag)
+    diag = flag_device_lock_for_review(diag)
 
     # Consistency check -- every feature column in windows.parquet should
     # appear in the diagnostics table, and every identity/context/flag
@@ -263,6 +339,20 @@ def build_behavioural_dataset(windows: pd.DataFrame, diag: pd.DataFrame):
           f"{len(kept_features)} kept, {n_dropped} dropped")
     print(diag.loc[diag["decision"] == "drop", "decision_reason"]
           .apply(lambda r: r.split(":")[0]).value_counts().to_string())
+
+    review = diag[diag.get("needs_manual_review", False) == True]  # noqa: E712
+    if len(review):
+        print(f"\n[behavioural] {len(review)} feature(s) KEPT but flagged device-locked -- "
+              f"review these by hand rather than trusting the flag either way:")
+        for f in review["feature"]:
+            assoc = review.loc[review["feature"] == f, "device_model_assoc"].iloc[0]
+            print(f"    {f}  (device_model_assoc={assoc})")
+
+    if "device_lock_assessable" in diag.columns:
+        n_unknown = int((~diag["device_lock_assessable"].fillna(True).astype(bool)).sum())
+        if n_unknown:
+            print(f"\n[behavioural] {n_unknown} feature(s) too near-constant for the device-lock "
+                  f"test to say anything; treated as unknown, not as evidence of absence.")
 
     return candidate, diag
 
