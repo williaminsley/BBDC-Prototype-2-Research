@@ -11,6 +11,9 @@
 #   5. qc           run_qc.py                    structural QC gate on the windowed dataset
 #   6. diagnostics  build_feature_diagnostics.py per-feature screening table (availability,
 #                                                 exposure/device/context confounds, redundancy)
+#   7. behavioural  build_behavioural_dataset.py filters windows.parquet down to the actual
+#                                                 model-input feature set, driven by
+#                                                 feature_diagnostics.csv's decisions
 #
 # Halt semantics are deliberately not uniform across stages, because the scripts
 # do not mean the same thing by a non-zero exit:
@@ -36,6 +39,12 @@
 #   - build_feature_diagnostics.py failures halt the run, same as windows --
 #     it is a straightforward build step (reads windows.parquet, writes
 #     feature_diagnostics.csv/.parquet) with no partial-continuation logic.
+#
+#   - build_behavioural_dataset.py failures halt the run, same reasoning --
+#     reads windows.parquet + feature_diagnostics.csv/.parquet, writes
+#     behavioural_windows_candidate.csv/.parquet and updates
+#     feature_diagnostics.csv/.parquet in place with decision columns.
+#     No partial-continuation logic here either.
 #
 # Usage:
 #   ./run_pipeline.sh                    full run
@@ -72,7 +81,7 @@ REPORTS_DIR="reports"
 LOGS_DIR="reports/logs"
 VALIDATION_REPORT="${REPORTS_DIR}/session_export_validation_p2.json"
 
-ALL_STAGES=(sync validate raw windows qc diagnostics)
+ALL_STAGES=(sync validate raw windows qc diagnostics behavioural)
 START_STAGE="sync"
 SKIP_CSV=0
 
@@ -83,7 +92,7 @@ usage() {
 run_pipeline.sh - BBDC Prototype 2 research pipeline runner
 
   --skip-sync        Skip the Firebase sync; use sessions already on disk.
-  --from STAGE       Start at STAGE. One of: sync, validate, raw, windows, qc, diagnostics.
+  --from STAGE       Start at STAGE. One of: sync, validate, raw, windows, qc, diagnostics, behavioural.
   --skip-csv         Pass --skip-csv to the raw and windows builds
                      (parquet only; skips the large, slow CSV copies).
   -h, --help         Show this message.
@@ -200,11 +209,11 @@ fi
 
 for stage_script in sync_sessions_p2.py validate_raw_sessions.py \
                     build_raw_dataset.py build_windows_dataset.py run_qc.py \
-                    build_feature_diagnostics.py; do
+                    build_feature_diagnostics.py build_behavioural_dataset.py; do
     [[ -f "${SCRIPTS_DIR}/${stage_script}" ]] \
         || fail preflight "Missing ${SCRIPTS_DIR}/${stage_script}"
 done
-echo "scripts   : all six present in ${SCRIPTS_DIR}/"
+echo "scripts   : all seven present in ${SCRIPTS_DIR}/"
 
 "$PYTHON" - <<'PY' || fail preflight "Core dependencies missing. Run: pip install -r requirements.txt"
 import sys
@@ -250,20 +259,20 @@ echo "PREFLIGHT OK"
 # --------------------------------------------------------- 1. sync ---------
 
 if should_run sync; then
-    banner "STAGE 1/6  sync  (sync_sessions_p2.py)"
+    banner "STAGE 1/7  sync  (sync_sessions_p2.py)"
     T0=$SECONDS
     "$PYTHON" "${SCRIPTS_DIR}/sync_sessions_p2.py" \
         || fail sync "sync_sessions_p2.py exited non-zero (missing credentials, or at least one session failed to download). Fix the cause, or re-run with --skip-sync to build from what is already on disk."
     stage_done "sync" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 1/6  sync ----"
+    echo "---- SKIPPED stage 1/7  sync ----"
 fi
 
 # ------------------------------------------------------ 2. validate --------
 
 if should_run validate; then
-    banner "STAGE 2/6  validate  (validate_raw_sessions.py)"
+    banner "STAGE 2/7  validate  (validate_raw_sessions.py)"
     T0=$SECONDS
 
     # Remove any previous run's report first. Otherwise, if this run's validate
@@ -342,13 +351,13 @@ PY
     stage_done "validate" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 2/6  validate ----"
+    echo "---- SKIPPED stage 2/7  validate ----"
 fi
 
 # ----------------------------------------------------------- 3. raw --------
 
 if should_run raw; then
-    banner "STAGE 3/6  raw  (build_raw_dataset.py)"
+    banner "STAGE 3/7  raw  (build_raw_dataset.py)"
     T0=$SECONDS
     # Exits 1 only when no session survived the structural gate - the real
     # "nothing usable" condition. Per-session EXCLUDED lines are printed above.
@@ -357,26 +366,26 @@ if should_run raw; then
     stage_done "raw" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 3/6  raw ----"
+    echo "---- SKIPPED stage 3/7  raw ----"
 fi
 
 # ------------------------------------------------------- 4. windows --------
 
 if should_run windows; then
-    banner "STAGE 4/6  windows  (build_windows_dataset.py)"
+    banner "STAGE 4/7  windows  (build_windows_dataset.py)"
     T0=$SECONDS
     "$PYTHON" "${SCRIPTS_DIR}/build_windows_dataset.py" $CSV_FLAG \
         || fail windows "build_windows_dataset.py exited non-zero. If it reported 'No windows produced', every session was shorter than one window length."
     stage_done "windows" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 4/6  windows ----"
+    echo "---- SKIPPED stage 4/7  windows ----"
 fi
 
 # ------------------------------------------------------------ 5. qc --------
 
 if should_run qc; then
-    banner "STAGE 5/6  qc  (run_qc.py)"
+    banner "STAGE 5/7  qc  (run_qc.py)"
     T0=$SECONDS
     # run_qc.py exits 1 on any HARD FAIL, 0 otherwise (soft warnings included).
     # Its full report goes to stdout, which this pipeline already captures via
@@ -389,13 +398,13 @@ if should_run qc; then
     stage_done "qc" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 5/6  qc ----"
+    echo "---- SKIPPED stage 5/7  qc ----"
 fi
 
 # ------------------------------------------------------ 6. diagnostics -----
 
 if should_run diagnostics; then
-    banner "STAGE 6/6  diagnostics  (build_feature_diagnostics.py)"
+    banner "STAGE 6/7  diagnostics  (build_feature_diagnostics.py)"
     T0=$SECONDS
     # Straightforward build step, same halt semantics as windows: reads
     # data/processed/windows.parquet, writes feature_diagnostics.csv/.parquet.
@@ -405,7 +414,25 @@ if should_run diagnostics; then
     stage_done "diagnostics" "$T0"
 else
     echo
-    echo "---- SKIPPED stage 6/6  diagnostics ----"
+    echo "---- SKIPPED stage 6/7  diagnostics ----"
+fi
+
+# ------------------------------------------------------ 7. behavioural -----
+
+if should_run behavioural; then
+    banner "STAGE 7/7  behavioural  (build_behavioural_dataset.py)"
+    T0=$SECONDS
+    # Straightforward build step, same halt semantics as diagnostics/windows:
+    # reads data/processed/windows.parquet + feature_diagnostics.csv/.parquet,
+    # writes behavioural_windows_candidate.csv/.parquet and updates
+    # feature_diagnostics.csv/.parquet in place with decision/decision_reason
+    # columns. No partial-continuation logic.
+    "$PYTHON" "${SCRIPTS_DIR}/build_behavioural_dataset.py" \
+        || fail behavioural "build_behavioural_dataset.py exited non-zero. Check that data/processed/windows.parquet and data/processed/feature_diagnostics.parquet both exist (the windows and diagnostics stages must have completed first)."
+    stage_done "behavioural" "$T0"
+else
+    echo
+    echo "---- SKIPPED stage 7/7  behavioural ----"
 fi
 
 # ---------------------------------------------------------------- done -----
@@ -421,6 +448,8 @@ for f in data/processed/raw_events.parquet \
          data/processed/windows_schema.json \
          data/processed/feature_diagnostics.csv \
          data/processed/feature_diagnostics.parquet \
+         data/processed/behavioural_windows_candidate.csv \
+         data/processed/behavioural_windows_candidate.parquet \
          "$VALIDATION_REPORT"; do
     if [[ -f "$f" ]]; then
         echo "    $(du -h "$f" | cut -f1)	$f"
