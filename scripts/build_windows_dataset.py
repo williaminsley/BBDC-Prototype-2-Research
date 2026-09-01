@@ -83,6 +83,28 @@ WINDOW_STRIDE_S = 7.5
 
 SESSION_META_COLS = ["sessionId", "participantId", "deviceFamily"]
 
+# Session-level context columns -- everything in raw_events.parquet that is
+# NOT event-level telemetry (a payload_* field, or a per-event timing/kind
+# column) but IS constant across every event in a session. Confirmed by
+# direct check (max nunique-per-session == 1 for every column below, across
+# the full 78-session export) before adding here -- not assumed from the
+# app's schema docs. These get broadcast onto every window row for that
+# session unchanged (no aggregation needed, unlike behavioural features),
+# the same way deviceFamily already was, so that device-model and
+# self-reported context are available as conditioning/metadata columns
+# in windows.parquet instead of being silently dropped at this stage.
+# Deliberately excludes deviceFamily (already in SESSION_META_COLS above)
+# to avoid duplicating it.
+SESSION_CONTEXT_COLS = [
+    "deviceModel", "devicePlatform",
+    "appVersion", "consentVersion", "schemaVersion",
+    "identitySource", "usableForSignalExtraction", "completedNormally",
+    "sessionIndex", "sessionDurationMs",
+    "ctxTimeOfDay", "ctxFatigue", "ctxFocusLevel", "ctxEnvironmentNoise",
+    "ctxMovement", "ctxPosture", "ctxHandUse", "ctxInputDevice",
+    "ctxCaffeine", "ctxAlcohol", "ctxPrivacy",
+]
+
 
 # =============================================================================
 # Window boundary construction
@@ -103,7 +125,18 @@ def build_window_grid(
     producing a short, non-comparable final window.
     """
     rows = []
-    meta = raw_df.groupby("sessionId")[["participantId", "deviceFamily"]].first()
+    # Only pull context columns that are actually present in this raw_df --
+    # column-selective loads (see __main__'s NEEDED_COLS) may not include
+    # all of them, and this function shouldn't hard-fail just because a
+    # narrower load was used upstream (e.g. in tests or older exports).
+    context_cols_present = [c for c in SESSION_CONTEXT_COLS if c in raw_df.columns]
+    missing_context_cols = [c for c in SESSION_CONTEXT_COLS if c not in raw_df.columns]
+    if missing_context_cols:
+        print(f"[windower] NOTE: {len(missing_context_cols)} session-context columns "
+              f"not present in this raw_df, skipped: {missing_context_cols}")
+
+    meta_cols = ["participantId", "deviceFamily"] + context_cols_present
+    meta = raw_df.groupby("sessionId")[meta_cols].first()
     extents = raw_df.groupby("sessionId")["tRelMs"].agg(t_min="min", t_max="max")
 
     for sid, ext in extents.iterrows():
@@ -123,14 +156,17 @@ def build_window_grid(
         for i in range(n_windows):
             w_start = t0 + i * stride_s
             w_end = w_start + window_length_s
-            rows.append({
+            row = {
                 "sessionId": sid,
                 "participantId": meta.loc[sid, "participantId"],
                 "deviceFamily": meta.loc[sid, "deviceFamily"],
                 "window_index": i,
                 "window_start_s": w_start,
                 "window_end_s": w_end,
-            })
+            }
+            for c in context_cols_present:
+                row[c] = meta.loc[sid, c]
+            rows.append(row)
 
     grid = pd.DataFrame(rows)
     print(f"[windower] built {len(grid):,} windows across {grid['sessionId'].nunique()} sessions "
@@ -356,6 +392,12 @@ def build_full_dataset(raw_df: pd.DataFrame,
     here so that check can happen without re-plumbing later.
     """
     windows, corrected = build_skeleton(raw_df, window_length_s, stride_s, return_corrected=True)
+    n_skeleton_cols = len(windows.columns)  # metadata/context/affordance cols
+                                              # before any feature family is
+                                              # attached -- computed here
+                                              # rather than hardcoded, since
+                                              # SESSION_CONTEXT_COLS presence
+                                              # can vary by raw_df load.
 
     print("\n[assembly] typing features...")
     windows = aggregate_typing_features(windows, raw_df)
@@ -373,9 +415,10 @@ def build_full_dataset(raw_df: pd.DataFrame,
     print("[assembly] motion features...")
     windows = aggregate_motion_features(windows, raw_df)
 
-    n_feature_cols = len(windows.columns) - 22  # 22 = skeleton/metadata column count
+    n_feature_cols = len(windows.columns) - n_skeleton_cols
     print(f"\n[assembly] done: {len(windows):,} windows x {len(windows.columns):,} columns "
-          f"({n_feature_cols:,} behavioural feature columns)")
+          f"({n_skeleton_cols:,} skeleton/metadata columns, "
+          f"{n_feature_cols:,} behavioural feature columns)")
 
     return windows
 
@@ -409,7 +452,7 @@ if __name__ == "__main__":
     NEEDED_COLS = [
         "sessionId", "participantId", "deviceFamily", "kind", "tRelMs",
         "taskId", "taskIndex", "activeArea",
-    ] + NEEDED_PAYLOAD_COLS
+    ] + SESSION_CONTEXT_COLS + NEEDED_PAYLOAD_COLS
 
     import pyarrow.parquet as pq
     available = set(pq.ParquetFile(raw_path).schema_arrow.names)
@@ -445,3 +488,30 @@ if __name__ == "__main__":
         print(f"Wrote {csv_path} ({csv_path.stat().st_size / 1e6:.1f} MB)")
     else:
         print("Skipped CSV export (--skip-csv)")
+
+    # Schema sidecar -- same shape as build_raw_dataset.py's
+    # raw_events_schema.json (per-column dtype/non-null coverage), plus a
+    # few windows-specific fields. run_pipeline.sh's completion summary
+    # already looks for this exact filename (data/processed/windows_schema.json)
+    # and has been reporting it as "not written" until now.
+    import json
+
+    schema = {
+        "row_count": int(len(full_windows)),
+        "column_count": int(len(full_windows.columns)),
+        "session_count": int(full_windows["sessionId"].nunique()),
+        "participant_count": int(full_windows["participantId"].nunique()),
+        "window_length_s": WINDOW_LENGTH_S,
+        "window_stride_s": WINDOW_STRIDE_S,
+        "columns": {
+            col: {
+                "dtype": str(full_windows[col].dtype),
+                "non_null_count": int(full_windows[col].notna().sum()),
+                "non_null_pct": round(float(full_windows[col].notna().mean()) * 100, 2),
+            }
+            for col in full_windows.columns
+        },
+    }
+    schema_path = out_dir / "windows_schema.json"
+    schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+    print(f"Wrote {schema_path}")
