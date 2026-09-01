@@ -31,10 +31,11 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).parent))  # ensures _stats resolves whether this
                                                     # module is run standalone or imported
                                                     # as part of the primitives package
-from _stats import compute_summary_stats, summary_stat_columns
+from _stats import compute_summary_stats, summary_stat_columns, pair_sequential_events
 
 TAP_DOWN_KIND = "touchstart"
 TAP_UP_KIND = "touchend"
+TAP_CANCEL_KIND = "touchcancel"
 MOVE_KIND = "touchmove"
 SCROLL_KINDS = ["scroll", "window_scroll"]  # excludes carousel_scroll -- see note in
                                               # earlier conversation record; ported
@@ -54,12 +55,26 @@ GESTURE_CLASSES = ["scroll_fling", "scroll_drag", "drag_swipe", "long_press", "t
 # =============================================================================
 
 def build_interactions(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Down/up pairing now delegates to _stats.pair_sequential_events() (2026-09
+    refactor) -- the same fix described there: touchcancel is merged into the
+    up-event search so the pairing pointer stops there correctly instead of
+    overshooting to steal a later touch's touchend, and each up is consumed
+    once so two close-together touchstarts can never claim the same touchend.
+    Previously implemented as a standalone loop directly in this file (see
+    git history for the original touchcancel bugfix); moved to the shared
+    helper so tap.py and typing_features.py -- which had independently
+    duplicated the OLDER, buggier version of this pairing pattern -- now call
+    the same corrected implementation instead of maintaining their own copies.
+    """
     rows = []
     for sid, s in raw_df.groupby("sessionId"):
         s = s.sort_values("tRelMs")
         pid = s["participantId"].iloc[0]
         downs = s.loc[s["kind"] == TAP_DOWN_KIND, "tRelMs"].to_numpy(dtype=float)
-        ups = s.loc[s["kind"] == TAP_UP_KIND, "tRelMs"].to_numpy(dtype=float)
+        up_events = s.loc[s["kind"].isin([TAP_UP_KIND, TAP_CANCEL_KIND]), ["tRelMs", "kind"]].sort_values("tRelMs")
+        ups = up_events["tRelMs"].to_numpy(dtype=float)
+        up_is_cancel = (up_events["kind"] == TAP_CANCEL_KIND).to_numpy()
         mv = s.loc[s["kind"] == MOVE_KIND, ["tRelMs", "payload_x", "payload_y"]]
         mv_t = mv["tRelMs"].to_numpy(dtype=float)
         mv_x = pd.to_numeric(mv["payload_x"], errors="coerce").to_numpy(dtype=float)
@@ -68,14 +83,17 @@ def build_interactions(raw_df: pd.DataFrame) -> pd.DataFrame:
         sc_t = sc["tRelMs"].to_numpy(dtype=float)
         sc_v = pd.to_numeric(sc["payload_scrollTop"], errors="coerce").to_numpy(dtype=float)
 
-        ui = 0
-        for d in downs:
-            while ui < len(ups) and ups[ui] < d:
-                ui += 1
-            if ui >= len(ups):
-                break
-            u = ups[ui]
-            ui += 1
+        down_idx, up_val, is_cancel = pair_sequential_events(downs, ups, up_is_cancel)
+
+        for di, u, cancelled in zip(down_idx, up_val, is_cancel):
+            if cancelled:
+                # Correctly consumed from the pairing sequence (so a later,
+                # genuine touchstart/touchend pair can't be stolen), but not
+                # emitted as an interaction -- a cancelled touch is not a
+                # genuine completed press-release.
+                continue
+
+            d = downs[di]
             hold = u - d
 
             mm = (mv_t >= d) & (mv_t <= u)

@@ -55,8 +55,16 @@ ORIENT_KIND = "deviceorientation"
 ACCEL_COLS = ["payload_ax", "payload_ay", "payload_az"]
 
 INTERACTION_KINDS = ["keydown", "keyup", "input", "touchstart", "touchmove", "touchend",
-                     "scroll", "window_scroll", "carousel_scroll", "pointerdown",
-                     "pointerup", "click"]
+                     "touchcancel", "scroll", "window_scroll", "carousel_scroll",
+                     "pointerdown", "pointerup", "pointercancel", "click"]
+                     # touchcancel/pointercancel added 2026-09: these are
+                     # genuine physical interaction moments (the person WAS
+                     # touching the device even though the browser aborted
+                     # the touch) that were previously missing from this
+                     # list, so motion samples right around a cancel event
+                     # could be wrongly classified as "idle" -- same class
+                     # of oversight as the gesture_hold_ms touchcancel bug,
+                     # concentrated on the same high-cancel-rate device.
 IDLE_GUARD_MS = 1000.0   # ported from 08_1 -- a motion sample counts as "idle" only if
                           # it's at least this far from any interaction event on either side
 MIN_IDLE_RUN = 60         # samples (~3s at the observed ~20Hz rate) -- ported from 08_1/08_2
@@ -95,14 +103,45 @@ def idle_mask(sess: pd.DataFrame, motion_t_ms: np.ndarray) -> np.ndarray:
     return (prev_gap >= IDLE_GUARD_MS) & (next_gap >= IDLE_GUARD_MS)
 
 
+def orientation_series_pair(sess: pd.DataFrame):
+    """
+    Beta AND gamma extracted together from the SAME orientation event rows,
+    keeping both positionally aligned to the same timestamps.
+
+    FIX (2026-09): the previous approach called orientation_series() twice,
+    once per column, each independently dropping rows where THAT column's
+    value was non-finite. If beta and gamma ever had different NaN
+    positions (plausible if either sensor axis briefly failed to report
+    within an otherwise-populated event), the two returned arrays would
+    silently misalign once truncated to a common length in
+    _cross_axis_corr_series -- position i in the beta array would not
+    necessarily correspond to the same timestamp as position i in the
+    gamma array. Not empirically confirmed as having caused wrong output on
+    this cohort's data, but a real risk with no guard against it. Fixed by
+    filtering both columns from one shared frame with a single "both
+    finite" mask, so alignment is guaranteed by construction rather than by
+    assumption."""
+    o = sess.loc[sess["kind"] == ORIENT_KIND].sort_values("tRelMs")
+    t = o["tRelMs"].to_numpy(dtype=float) / 1000.0
+    b = pd.to_numeric(o["payload_beta"], errors="coerce").to_numpy(dtype=float)
+    g = pd.to_numeric(o["payload_gamma"], errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(t) & np.isfinite(b) & np.isfinite(g)
+    return t[ok], b[ok], g[ok]
+
+
 def orientation_series(sess: pd.DataFrame, col: str = "payload_beta"):
-    """Beta/gamma series for cross-axis coupling. Uses the already-unwrapped
-    beta if corrections.py has run (payload_beta_residual/_baseline present);
-    falls back to raw payload_beta/gamma otherwise, since cross-axis coupling
-    is about the RATE OF CHANGE (diff), which is far less sensitive to a
-    0/360-style wrap than an absolute mean would be -- a single wrap event
-    would show up as one large diff outlier, not a systematic bias, so this
-    family does not require the same circular-encoding treatment corrections.py
+    """Single-column beta OR gamma series. No longer called within this
+    file (see orientation_series_pair() above, used by
+    _cross_axis_corr_series instead) -- kept as it may still be used from
+    notebooks or other scripts referencing this module directly.
+
+    Uses the already-unwrapped beta if corrections.py has run
+    (payload_beta_residual/_baseline present); falls back to raw
+    payload_beta/gamma otherwise, since cross-axis coupling is about the
+    RATE OF CHANGE (diff), which is far less sensitive to a 0/360-style
+    wrap than an absolute mean would be -- a single wrap event would show
+    up as one large diff outlier, not a systematic bias, so this family
+    does not require the same circular-encoding treatment corrections.py
     applies for absolute-value aggregation."""
     o = sess.loc[sess["kind"] == ORIENT_KIND].sort_values("tRelMs")
     t = o["tRelMs"].to_numpy(dtype=float) / 1000.0
@@ -152,13 +191,14 @@ def _sway_tremor_power(mag_idle: np.ndarray) -> tuple:
 
 def _cross_axis_corr_series(sess: pd.DataFrame, w_start_s: float, w_end_s: float) -> np.ndarray:
     """Rolling correlation between beta-diff and gamma-diff, restricted to
-    one window's span. Ported/adapted from 08_2's cross_axis_coupling."""
-    t_b, b = orientation_series(sess, "payload_beta")
-    t_g, g = orientation_series(sess, "payload_gamma")
-    n = min(len(b), len(g))
+    one window's span. Ported/adapted from 08_2's cross_axis_coupling.
+    Uses orientation_series_pair() (not two separate orientation_series()
+    calls) so beta and gamma stay positionally aligned to the same
+    timestamps by construction -- see that function's docstring."""
+    t, b, g = orientation_series_pair(sess)
+    n = len(t)
     if n < 20:
         return np.array([]), np.array([])
-    b, g, t = b[:n], g[:n], t_b[:n]
     db, dg = np.diff(b), np.diff(g)
     t_mid = t[1:]
     win = max(5, int(round(ROLL_WINDOW_S * (n / max(t[-1] - t[0], 1e-6)))))

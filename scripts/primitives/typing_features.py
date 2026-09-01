@@ -37,7 +37,7 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).parent))  # ensures _stats resolves whether this
                                                     # module is run standalone or imported
                                                     # as part of the primitives package
-from _stats import compute_summary_stats, summary_stat_columns
+from _stats import compute_summary_stats, summary_stat_columns, pair_sequential_events
 
 KEY_DOWN_KIND = "keydown"
 KEY_UP_KIND = "keyup"
@@ -63,20 +63,39 @@ def extract_keydown_events(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def paired_durations(sess: pd.DataFrame, down_kind: str, up_kind: str) -> pd.DataFrame:
+    """
+    BUG FIX (2026-09): this used to independently re-implement down/up
+    pairing with a "search forward for the next up after me" pattern that
+    had no memory of up events already claimed by an earlier down -- the
+    same bug found and fixed in gesture.py's build_interactions() (and also
+    present in tap.py's tap_hold_durations, fixed alongside this). Confirmed
+    on real cohort data: 298 of 7,219 dwell pairs (4.1%) reused the same
+    keyup timestamp across multiple keydowns -- this happens whenever two
+    keys go down before either comes up (normal in fast typing or
+    two-handed use, not an edge case), silently corrupting one or both of
+    the resulting dwell times. Now delegates to the shared, corrected
+    _stats.pair_sequential_events() instead of maintaining a separate
+    implementation. Keyboard events have no cancel concept (no keyboard
+    equivalent of touchcancel), so up_is_cancel is not used here.
+    """
     d = sess.loc[sess["kind"] == down_kind,
                  ["sessionId", "participantId", "tRelMs", "payload_keyClass"]].copy()
+    d = d.sort_values("tRelMs").reset_index(drop=True)
     u = sess.loc[sess["kind"] == up_kind, "tRelMs"].sort_values().to_numpy(dtype=float)
-    d = d.sort_values("tRelMs")
+    if d.empty or len(u) == 0:
+        return pd.DataFrame(columns=["sessionId", "participantId", "t_s", "dwell_ms", "keyClass"])
+
+    down_t = d["tRelMs"].to_numpy(dtype=float)
+    down_idx, up_val, _ = pair_sequential_events(down_t, u)
+
     rows = []
-    for _, r in d.iterrows():
-        t0 = float(r["tRelMs"])
-        nxt = u[u > t0]
-        if len(nxt):
-            rows.append({
-                "sessionId": r["sessionId"], "participantId": r["participantId"],
-                "t_s": t0 / 1000.0, "dwell_ms": nxt[0] - t0,
-                "keyClass": r.get("payload_keyClass", np.nan),
-            })
+    for di, u_t in zip(down_idx, up_val):
+        r = d.iloc[di]
+        rows.append({
+            "sessionId": r["sessionId"], "participantId": r["participantId"],
+            "t_s": down_t[di] / 1000.0, "dwell_ms": u_t - down_t[di],
+            "keyClass": r.get("payload_keyClass", np.nan),
+        })
     return pd.DataFrame(rows) if rows else pd.DataFrame(
         columns=["sessionId", "participantId", "t_s", "dwell_ms", "keyClass"])
 
