@@ -178,7 +178,7 @@ def parse_metric_and_suffix(feature: str, family: str) -> tuple[str, str]:
     present. Columns without a stat suffix (tap_coverage, tap_count, the
     afforded/observed flags) get stat_suffix='none'."""
     body = feature[len(family) + 1:]
-    KNOWN_SUFFIXES = ("mean", "std", "median", "iqr", "p95", "max", "n", "cv", "slope", "tailmean")
+    KNOWN_SUFFIXES = ("mean", "std", "median", "iqr", "p95", "max", "n", "cv", "slope")
     parts = body.rsplit("_", 1)
     if len(parts) == 2 and parts[1] in KNOWN_SUFFIXES:
         return parts[0], parts[1]
