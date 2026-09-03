@@ -95,6 +95,22 @@ SESSION_LEVEL_FIELDS = {
        for key in CONTEXT_STRING_FIELDS},
 }
 
+# Manually confirmed corrections to self-reported session-context metadata,
+# keyed by sessionId. This does NOT touch data/raw/sessions/*/session.json
+# (which stays exactly as collected, per the project's raw-preservation
+# principle) -- it's applied here, at canonical-build time, so it survives
+# any number of re-syncs from Firebase and stays fully auditable in one
+# place, the same pattern as P1's reaction-time correction and this
+# project's own corrections.py.
+#
+# p3M6E7Z's probe session (5d96fed676874483a08dbfc88f0fa0d2) self-reported
+# deviceModel="iphone_17e" via the app's dropdown, while their enrolment
+# session and every other reported field are consistent with
+# "iphone_16_plus". Confirmed with the participant as a dropdown
+# mis-selection, not an actual device change -- corrected accordingly.
+SESSION_METADATA_CORRECTIONS: dict[str, dict[str, object]] = {
+    "5d96fed676874483a08dbfc88f0fa0d2": {"deviceModel": "iphone_16_plus"},
+}
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build canonical raw P2 events dataset from validated session.json files.")
@@ -155,6 +171,9 @@ def flatten_session_events(session: dict) -> List[dict]:
     """One row per raw event, with session-identifying columns attached to every row
     so sessions remain fully separable after all sessions are stacked together."""
     session_meta = {col: getter(session) for col, getter in SESSION_LEVEL_FIELDS.items()}
+    sid = session_meta.get("sessionId")
+    if sid in SESSION_METADATA_CORRECTIONS:
+        session_meta.update(SESSION_METADATA_CORRECTIONS[sid])
     events = session.get("events") or []
 
     rows: List[dict] = []
