@@ -174,6 +174,7 @@ def flatten_session_events(session: dict) -> List[dict]:
     sid = session_meta.get("sessionId")
     if sid in SESSION_METADATA_CORRECTIONS:
         session_meta.update(SESSION_METADATA_CORRECTIONS[sid])
+        print(f"[correction applied] {sid}: {SESSION_METADATA_CORRECTIONS[sid]}")
     events = session.get("events") or []
 
     rows: List[dict] = []
